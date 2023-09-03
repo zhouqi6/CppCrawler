@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <strsafe.h>
 #include <filesystem>
+#include <future>
 #include "thread"
 #include "Album.h"
 
@@ -52,12 +53,12 @@ vector<string> getPictureDownloadUrls(const std::string& albumPage){
     //std::cout << "getPictureDownloadUrls size:" << pictureUrls.size() << std::endl; // 输出匹配的子字符串
     return pictureUrls;
 }
-void downloadPicture(string& pictureUrl, const wstring& albumFolder, size_t count){
+bool downloadPicture(string& pictureUrl, const wstring& albumFolder, size_t count){
     html imagePage;
     memset(&imagePage, 0, sizeof(html));
     CurlExcutor::getRequest(pictureUrl.c_str(), nullptr, &imagePage);
     if(imagePage.response== nullptr){
-        return;
+        return false;
     }
     string &&imagePageStr = imagePage.response;
     vector<string> pictureDownloadUrls = getPictureDownloadUrls(imagePageStr);
@@ -73,10 +74,54 @@ void downloadPicture(string& pictureUrl, const wstring& albumFolder, size_t coun
             fclose(temp_file);
         }
     }
+    return true;
+}
+bool albumDownload(const string& albumUrl,const string& localRootPath){
+
+    int maxConcurrentPicNum = 20;
+    int pictureWorkWaitInterval = 4;
+    Album album(albumUrl);
+    do {
+        album.downloadAlbumCurrentPage();
+        album.parsePicturePageUrls();
+        if(album.pageTotalNum <= 0){
+            album.parseTitle();
+            album.getPageCount();
+            bool makeDirSucceeded = album.setAndMakeAlbumDir(localRootPath);
+            if(!makeDirSucceeded){
+                return false;
+            }
+        }
+    }while(album.toNextPosUrl());
+
+    vector<std::future<bool>> pictureDownloadResults;
+    for(size_t i = 0;i<album.albumPicturePageUrls.size();){
+        if(pictureDownloadResults.size() >= maxConcurrentPicNum){
+            for(size_t j=0;j<pictureDownloadResults.size();++j){
+                if (pictureDownloadResults[j].wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                    //std::cout << "pictureDownload finished execution, set work "<<i<< " now\n";
+                    pictureDownloadResults[j] = std::async(std::launch::async, downloadPicture,ref(album.albumPicturePageUrls[i]),album.albumFolderStr_W, i);
+                    ++i;
+                    break;
+                } else {
+                    continue;
+                }
+            }
+            // 并发的图片下载任务数达到maxConcurrentPicNum，睡眠图片集下载任务线程
+            // 等待任务执行pictureWorkWaitInterval秒后再次查询任务状态
+            std::this_thread::sleep_for(std::chrono::seconds(pictureWorkWaitInterval));
+        }else{
+            pictureDownloadResults.emplace_back(std::async(std::launch::async, downloadPicture,ref(album.albumPicturePageUrls[i]),album.albumFolderStr_W, i));
+            ++i;
+        }
+    }
+
+    return true;
 }
 
-int main()
+int main1()
 {
+    //单线程下载相册，每个相册多线程下载
     SetConsoleOutputCP(CP_UTF8);
     string localPath = R"(D:\P\Image\eHentai)";
     html albumListPage;
@@ -107,6 +152,43 @@ int main()
         }
         for(auto& pictureThread:pictureThreads){
             pictureThread.join();
+        }
+    }
+
+    return 0;
+}
+
+int main()
+{
+    SetConsoleOutputCP(CP_UTF8);
+    string localPath = R"(D:\P\Image\eHentai)";
+    html albumListPage;
+    memset(&albumListPage, 0, sizeof(html));
+    int maxConcurrentAlbumNum = 10;
+    int albumNumWorkWaitInterval = 10;
+    const char* eHentaiUrl = "https://e-hentai.org/popular";
+    CurlExcutor::getRequest(eHentaiUrl, nullptr, &albumListPage);
+    vector<string>&& albumUrls = parsePageAndGetAlbumUrls(albumListPage);
+    vector<std::future<bool>> albumDownloadResults;
+    for(size_t i=0;i<albumUrls.size();){
+        string &albumUrl =albumUrls[i];
+        if(albumDownloadResults.size() >= maxConcurrentAlbumNum){
+            for(size_t j=0;j<albumDownloadResults.size();++j){
+                if (albumDownloadResults[j].wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                    std::cout << "albumDownload finished execution, set work "<<i<< " now\n";
+                    albumDownloadResults[j] = std::async(std::launch::async, albumDownload,albumUrls[i],localPath);
+                    ++i;
+                    break;
+                } else {
+                    continue;
+                }
+            }
+            // 并发的图片集任务数达到maxConcurrentAlbumNum，睡眠主线程
+            // 等待任务执行albumNumWorkWaitInterval秒后再次查询任务状态
+            std::this_thread::sleep_for(std::chrono::seconds(albumNumWorkWaitInterval));
+        }else{
+            albumDownloadResults.emplace_back(std::async(std::launch::async, albumDownload,albumUrls[i],localPath));
+            ++i;
         }
     }
 
