@@ -10,7 +10,7 @@
 #include <cstdio>
 
 using namespace std;
-CURLcode CurlExcutor::getRequest(const char *url, char *cookie, FILE *file) {
+CURLcode CurlExcutor::getRequest(const char *url, char *cookie, const wstring& filePath) {
     char strHeader[2048] = {0};
 
     CURL* curl = curl_easy_init();
@@ -23,6 +23,12 @@ CURLcode CurlExcutor::getRequest(const char *url, char *cookie, FILE *file) {
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 120);// 超时10秒
 
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlCallbacks::fileWriteCallback);
+
+    FILE *file = _wfopen(filePath.c_str(), L"wb");
+    if (file == nullptr) {
+        cout<<"_wfopen failed :"<<strerror(errno)<<" in func:"<< __FUNCTION__ <<endl;
+    }else{
+    }
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, CurlCallbacks::header_callback);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, strHeader);
@@ -45,8 +51,14 @@ CURLcode CurlExcutor::getRequest(const char *url, char *cookie, FILE *file) {
     while(retryCount++ <masRetry && (code = curl_easy_perform(curl)) != CURLE_OK) {
         cout << "curl_easy_perform failed, retry time:" << retryCount << endl;
         // 清除文件内容
-//        fseek(file, 0, SEEK_END);
-//        ftruncate(fileno(file), 0);
+        fclose(file);
+        file = _wfopen(filePath.c_str(), L"wb");
+        if (file == nullptr) {
+            cout<<"_wfopen failed :"<<strerror(errno)<<" in func:"<< __FUNCTION__ <<endl;
+            break;
+        }else{
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
+        }
         // 睡眠当前线程
         std::this_thread::sleep_for(std::chrono::seconds(retryInterval*retryCount));
     }
@@ -62,6 +74,7 @@ CURLcode CurlExcutor::getRequest(const char *url, char *cookie, FILE *file) {
     }
     if (curl)
         curl_easy_cleanup(curl);
+    fclose(file);
     return code;
 }
 

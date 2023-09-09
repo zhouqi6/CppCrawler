@@ -12,8 +12,22 @@
 #include <future>
 #include "thread"
 #include "Album.h"
+#include "ThreadPool.h"
 
 using namespace std;
+constexpr size_t maxWaitIntervalSeconds = 300;
+constexpr size_t minWaitIntervalSeconds = 10;
+void sleepForSeconds(size_t taskNum){
+    size_t waitIntervalSeconds;
+    if(taskNum < minWaitIntervalSeconds){
+        waitIntervalSeconds = minWaitIntervalSeconds;
+    }else if(taskNum > maxWaitIntervalSeconds){
+        waitIntervalSeconds = maxWaitIntervalSeconds;
+    }else{
+        waitIntervalSeconds = taskNum;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(waitIntervalSeconds));
+}
 vector<string> parsePageAndGetAlbumUrls(html& pageWithAlbums){
     vector<string> albums;
     string response = pageWithAlbums.response;
@@ -62,24 +76,18 @@ bool downloadPicture(string& pictureUrl, const wstring& albumFolder, size_t coun
     }
     string &&imagePageStr = imagePage.response;
     vector<string> pictureDownloadUrls = getPictureDownloadUrls(imagePageStr);
-    if(pictureDownloadUrls.size()>0){
+    if(!pictureDownloadUrls.empty()){
         // 创建一个临时文件用于保存图片数据
         wstringstream wStream;
         wStream << albumFolder << L"\\" << count << L".jpg";
-        FILE *temp_file = _wfopen(wStream.str().c_str(), L"wb");
-        if (temp_file == nullptr) {
-            cout<<"_wfopen failed :"<<strerror(errno)<<" in func:"<< __FUNCTION__ <<endl;
-        }else{
-            CurlExcutor::getRequest(pictureDownloadUrls[0].c_str(), nullptr, temp_file);
-            fclose(temp_file);
-        }
+        CurlExcutor::getRequest(pictureDownloadUrls[0].c_str(), nullptr, wStream.str());
     }
     return true;
 }
-bool albumDownload(const string& albumUrl,const string& localRootPath){
+bool albumDownload_with_future(const string& albumUrl, const string& localRootPath){
 
     int maxConcurrentPicNum = 20;
-    int pictureWorkWaitInterval = 4;
+    int pictureWorkWaitInterval = 1;
     Album album(albumUrl);
     do {
         album.downloadAlbumCurrentPage();
@@ -97,10 +105,10 @@ bool albumDownload(const string& albumUrl,const string& localRootPath){
     vector<std::future<bool>> pictureDownloadResults;
     for(size_t i = 0;i<album.albumPicturePageUrls.size();){
         if(pictureDownloadResults.size() >= maxConcurrentPicNum){
-            for(size_t j=0;j<pictureDownloadResults.size();++j){
-                if (pictureDownloadResults[j].wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            for(auto & pictureDownloadResult : pictureDownloadResults){
+                if (pictureDownloadResult.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                     //std::cout << "pictureDownload finished execution, set work "<<i<< " now\n";
-                    pictureDownloadResults[j] = std::async(std::launch::async, downloadPicture,ref(album.albumPicturePageUrls[i]),album.albumFolderStr_W, i);
+                    pictureDownloadResult = std::async(std::launch::async, downloadPicture,ref(album.albumPicturePageUrls[i]),album.albumFolderStr_W, i);
                     ++i;
                     break;
                 } else {
@@ -116,6 +124,37 @@ bool albumDownload(const string& albumUrl,const string& localRootPath){
         }
     }
 
+    return true;
+}
+bool albumDownload_with_threadPool(const string& albumUrl, const string& localRootPath){
+
+    int maxConcurrentPicNum = 10;
+    int pictureWorkWaitInterval = 10;
+    Album album(albumUrl);
+    //get all picturePageUrls
+    do {
+        album.downloadAlbumCurrentPage();
+        album.parsePicturePageUrls();
+        if(album.pageTotalNum <= 0){
+            album.parseTitle();
+            album.getPageCount();
+            bool makeDirSucceeded = album.setAndMakeAlbumDir(localRootPath);
+            if(!makeDirSucceeded){
+                //创建文件夹失败，已打印日志，后面无法继续下载
+                return false;
+            }
+        }
+    }while(album.toNextPosUrl());
+
+    ThreadPool threadPoolForPictures(maxConcurrentPicNum);
+    for(size_t i = 0;i<album.albumPicturePageUrls.size();++i){
+        threadPoolForPictures.enqueue(downloadPicture,ref(album.albumPicturePageUrls[i]),album.albumFolderStr_W, i);
+    }
+
+    while(threadPoolForPictures.gotWorkToDo()){
+        //等待所有任务完成，每若干秒查询一次 ，查询过于频繁会导致性能下降
+        sleepForSeconds(threadPoolForPictures.getJobSize());
+    }
     return true;
 }
 
@@ -158,7 +197,7 @@ int main1()
     return 0;
 }
 
-int main()
+int future_main()
 {
     SetConsoleOutputCP(CP_UTF8);
     string localPath = R"(D:\P\Image\eHentai)";
@@ -175,8 +214,9 @@ int main()
         if(albumDownloadResults.size() >= maxConcurrentAlbumNum){
             for(size_t j=0;j<albumDownloadResults.size();++j){
                 if (albumDownloadResults[j].wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-                    std::cout << "albumDownload finished execution, set work "<<i<< " now\n";
-                    albumDownloadResults[j] = std::async(std::launch::async, albumDownload,albumUrls[i],localPath);
+                    std::cout << "albumDownload_with_future finished execution, set work "<<i<< " now\n";
+                    albumDownloadResults[j] = std::async(std::launch::async, albumDownload_with_future, albumUrls[i],
+                                                         localPath);
                     ++i;
                     break;
                 } else {
@@ -187,10 +227,36 @@ int main()
             // 等待任务执行albumNumWorkWaitInterval秒后再次查询任务状态
             std::this_thread::sleep_for(std::chrono::seconds(albumNumWorkWaitInterval));
         }else{
-            albumDownloadResults.emplace_back(std::async(std::launch::async, albumDownload,albumUrls[i],localPath));
+            albumDownloadResults.emplace_back(
+                    std::async(std::launch::async, albumDownload_with_future, albumUrls[i], localPath));
             ++i;
         }
     }
 
+    return 0;
+}
+
+int main()
+{
+    SetConsoleOutputCP(CP_UTF8);
+    string localPath = R"(D:\P\Image\eHentai)";
+    html albumListPage;
+    memset(&albumListPage, 0, sizeof(html));
+    int maxConcurrentAlbumNum = 10;
+    int albumNumWorkWaitInterval = 15;
+    const char* eHentaiUrl = "https://e-hentai.org/popular";
+    CurlExcutor::getRequest(eHentaiUrl, nullptr, &albumListPage);
+    vector<string>&& albumUrls = parsePageAndGetAlbumUrls(albumListPage);
+    ThreadPool threadPoolForAlbums(maxConcurrentAlbumNum);
+    vector<std::future<bool>> albumDownloadResults;
+    {
+        for(size_t i=0;i<albumUrls.size();++i){
+            threadPoolForAlbums.enqueue(albumDownload_with_threadPool, albumUrls[i], localPath);
+        }
+    }
+    while(threadPoolForAlbums.gotWorkToDo()){
+        //等待所有任务完成，每若干秒查询一次 ，查询过于频繁会导致性能下降
+        sleepForSeconds(threadPoolForAlbums.getJobSize());
+    }
     return 0;
 }
